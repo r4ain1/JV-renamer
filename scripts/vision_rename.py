@@ -110,25 +110,32 @@ SYS_PROMPT = '''你是成人影片内容识别与文件命名助手。输入为�
 def call_vision(img_path, api_base, api_key, model, timeout=120):
     with open(img_path,'rb') as f:
         b64 = base64.b64encode(f.read()).decode()
-    body = json.dumps({
-        "model": model,
-        "messages":[
-            {"role":"system","content":SYS_PROMPT},
-            {"role":"user","content":[
-                {"type":"text","text":"识别该视频内容并输出JSON"},
-                {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}
-            ]}
-        ],
-        "temperature":0.2,"max_tokens":1500
-    }).encode()
-    req = urllib.request.Request(
-        f"{api_base.rstrip('/')}/chat/completions", data=body,
-        headers={'Content-Type':'application/json','Authorization':f'Bearer {api_key}'})
-    res = urllib.request.urlopen(req,timeout=timeout).read().decode()
-    content = json.loads(res)['choices'][0]['message']['content'].strip()
-    content = re.sub(r'^```(json)?|```$','',content).strip()
-    m = re.search(r'\{.*\}', content, re.S)
-    return json.loads(m.group(0)) if m else None
+    for m in [model, 'claude-sonnet-4-6']:
+        body = json.dumps({
+            "model": m,
+            "messages":[
+                {"role":"system","content":SYS_PROMPT},
+                {"role":"user","content":[
+                    {"type":"text","text":"识别该视频内容并输出JSON"},
+                    {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}
+                ]}
+            ],
+            "temperature":0.2,"max_tokens":1500
+        }).encode()
+        try:
+            req = urllib.request.Request(
+                f"{api_base.rstrip('/')}/chat/completions", data=body,
+                headers={'Content-Type':'application/json','Authorization':f'Bearer {api_key}'})
+            res = urllib.request.urlopen(req,timeout=timeout).read().decode()
+            msg = json.loads(res)['choices'][0].get('message', {})
+            content = (msg.get('content') or '').strip()
+            content = re.sub(r'^```(json)?|```$','',content).strip()
+            matched = re.search(r'\{.*\}', content, re.S)
+            if matched:
+                return json.loads(matched.group(0))
+        except Exception as e:
+            continue
+    return None
 
 # ---------- 3. 命名生成 ----------
 
@@ -183,12 +190,16 @@ def needs_vision(fname):
     if re.match(r'^\[', stem): return False  # 已规范
     if re.match(r'^[A-Za-z]{2,6}-\d{2,5}', stem): return False  # 标准番号
     if re.search(r'[\u4e00-\u9fff]', stem): return False  # 含中文有语义
+    # 纯数字
+    if re.match(r'^\d+$', stem): return True
+    # 包含 watermarked
+    if 'watermarked' in stem.lower(): return True
     # protected_content_*/media_group_*/日期/数字hash/纯英文随机
-    if re.match(r'^(protected_content|media_group|video|VID_|IMG_|MOV_|download|\d+月\d+日|\d{4}-\d{2}-\d{2}|[a-f0-9]{16,})', stem, re.I):
+    if re.match(r'^(protected_content|media_group|video|VID_|IMG_|MOV_|download|\d+月\d+日|\d{4}-\d{2}-\d{2}|[a-f0-9]{12,})', stem, re.I):
         return True
     # 全英文但无单词意义 > 无语义
     words = re.findall(r'[a-z]{3,}', stem.lower())
-    if len(words) <= 1 and len(stem) > 10:
+    if len(words) <= 1 and len(stem) > 8:
         return True
     return False
 
@@ -199,9 +210,14 @@ def process_one(f, target_dir, frames_dir, args):
     video_path = os.path.join(target_dir, f)
     stem, ext = os.path.splitext(f)
     try:
+        if not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
+            return f, f"[损坏零字节]_{stem}{ext}", {"category": "损坏"}
+        dur = probe_duration(video_path)
+        if dur is None or dur < 2:
+            return f, f"[损坏]_{stem}{ext}", {"category": "损坏"}
         frames = extract_frames(video_path, frames_dir, n_frames=args.frames)
         if not frames:
-            return f, None, 'no_frames'
+            return f, f"[损坏]_{stem}{ext}", {"category": "损坏"}
         grid_path = os.path.join(frames_dir, re.sub(r'[^\w\-]','_',stem)[:40] + '_grid.jpg')
         if not make_grid(frames, grid_path, cols=min(4,args.frames)):
             return f, None, 'grid_fail'

@@ -13,6 +13,7 @@ import csv
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -172,7 +173,7 @@ SYS_PROMPT_JAV = '''你是日本成人影片元数据整理助手。输入为若
 3) tags：正好3个中文分类标签，从官方分类中挑选最能代表作品的3个，统一为简体中文常用词（如 人妻/女教师/痴汉/NTR/中出/巨乳/制服/凌辱/单体作品/口交/搜查官/美乳 等）。
 只输出JSON数组，元素形如 {"i":0,"zh_title":"...","actress_cn":["..."],"tags":["..","..",".."]}，不要任何解释文字，不要markdown。'''
 
-def call_llm_jav(batch, api_base, api_key, model="claude-sonnet-4-6"):
+def call_llm_jav(batch, api_base, api_key, model="group/flash"):
     items = []
     for j, m in enumerate(batch):
         items.append({
@@ -207,8 +208,8 @@ def call_llm_jav(batch, api_base, api_key, model="claude-sonnet-4-6"):
         content = m.group(0)
     return json.loads(content)
 
-SYS_PROMPT_SCHEME_B = '''你是中文影视资源整理与规范命名专家。输入为一组未经整理的非标准番号成人影视/短片文件名列表。
-任务：请根据文件命名特征，将其归纳为以下 5 种分类并按照严格规范输出重命名结果：
+SYS_PROMPT_SCHEME_B = '''你是中文影视资源整理与规范命名专家。输入为一组未经整理的非标准番号成人影视/短片列表，每条包含 `filename`（文件名），部分条目还包含 `context`（如 Telegram 消息正文、频道简介或补充说明）。
+任务：请综合 `filename` 与 `context`（若文件名无语义如日期/数字/protected_content/media_group，则优先依据 `context` 提取信息），将其归纳为以下 5 种分类并按照严格规范输出重命名结果：
 
 1. 【明星AI换脸/二创类】（以 #明星名 开头，或含 AI换脸、AI明星、明星名剧情演义、PMV、911爆料、每日大赛等）：
    - 提取主角明星（如 刘亦菲、杨幂、迪丽热巴、宋轶、IU李知恩、赵露思、古力娜扎 等，多位明星用顿号连接）
@@ -237,8 +238,15 @@ SYS_PROMPT_SCHEME_B = '''你是中文影视资源整理与规范命名专家。�
 - new_name 绝对不要包含扩展名（如 .mp4/.m3u8）！不要包含 Windows 非法字符 (/ \\ : * ? " < > |)
 - 严禁任何额外解释文字，只输出纯 JSON。'''
 
-def call_llm_scheme_b(batch, api_base, api_key, model="claude-sonnet-4-6"):
-    items = [{'i': j, 'filename': item} for j, item in enumerate(batch)]
+def call_llm_scheme_b(batch, api_base, api_key, model="group/smart", context_map=None):
+    context_map = context_map or {}
+    items = []
+    for j, item in enumerate(batch):
+        entry = {'i': j, 'filename': item}
+        ctx = (context_map.get(item) or "").strip()
+        if ctx:
+            entry['context'] = ctx[:600]
+        items.append(entry)
     body = json.dumps({
         'model': model,
         'messages': [
@@ -286,10 +294,15 @@ def main():
     parser.add_argument("--dir", default=".", help="视频所在目标目录")
     parser.add_argument("--mode", default="all", choices=["jav", "non-jav", "all"], help="执行模式: jav(仅标准番号), non-jav(仅AI/国产/欧美等), all(全品类完整流水线)")
     parser.add_argument("--proxy", default="http://127.0.0.1:7890", help="网络代理地址")
-    parser.add_argument("--api-base", default="http://127.0.0.1:8317/v1", help="LLM API Base URL")
-    parser.add_argument("--api-key", default=os.getenv("LOCAL_8317_API_KEY", "123456"), help="LLM API Key")
-    parser.add_argument("--jav-model", default="gemini-3.8-flash-high", help="标准番号元数据处理 LLM 模型")
-    parser.add_argument("--b-model", default="claude-sonnet-4-6", help="非标准番号资源处理 LLM 模型")
+    parser.add_argument("--api-base", default="http://127.0.0.1:3425/v1", help="LLM API Base URL")
+    parser.add_argument("--api-key", default=os.getenv("MAGPIE_API_KEY", "magpie"), help="LLM API Key")
+    parser.add_argument("--jav-model", default="group/flash", help="标准番号元数据处理 LLM 模型")
+    parser.add_argument("--b-model", default="group/smart", help="非标准番号资源处理 LLM 模型")
+    parser.add_argument("--context-json", default=None, help="外部上下文 JSON 路径（如 TG 消息正文映射 {文件名: 正文}），默认自动探测目录下 _context.json")
+    parser.add_argument("--vision-fallback", action="store_true", help="阶段 2 后对仍为 [杂项] 或无语义的视频自动调用 vision_rename.py 抽帧视觉识别")
+    parser.add_argument("--vision-model", default="", help="视觉识别模型（默认复用 --b-model）")
+    parser.add_argument("--vision-frames", type=int, default=8, help="视觉识别均匀抽帧数（默认8）")
+    parser.add_argument("--vision-interval", type=float, default=0.0, help="视觉识别按固定间隔抽帧（秒，>0 时启用，如 10 表示每隔10秒截1帧）")
     parser.add_argument("--apply", action="store_true", help="直接应用重命名，默认仅预览")
     parser.add_argument("--concurrency", type=int, default=4, help="网络抓取并发数")
     args = parser.parse_args()
@@ -298,6 +311,19 @@ def main():
     if not os.path.exists(target_dir):
         print(f"[!] 目标目录不存在: {target_dir}")
         sys.exit(1)
+
+    context_map = {}
+    ctx_path = args.context_json or os.path.join(target_dir, "_context.json")
+    if ctx_path and os.path.exists(ctx_path):
+        try:
+            with open(ctx_path, "r", encoding="utf-8") as cf:
+                raw_ctx = json.load(cf)
+                if isinstance(raw_ctx, dict):
+                    context_map = {str(k): str(v) for k, v in raw_ctx.items() if v}
+            if context_map:
+                print(f"[*] 已加载外部上下文映射: {len(context_map)} 条 ({os.path.basename(ctx_path)})")
+        except Exception as e:
+            print(f"[!] 加载上下文 JSON 失败: {e}")
 
     all_entries = [f for f in os.listdir(target_dir) if os.path.isfile(os.path.join(target_dir, f)) and not f.startswith('_')]
     print(f"[*] 扫描到 {len(all_entries)} 个文件 (目标目录: {target_dir})...")
@@ -314,7 +340,7 @@ def main():
         for f in video_files:
             if re.match(r'^\[[A-Za-z0-9]+-\d+\]\s+', f):
                 continue  # 已经规范命名
-            code = extract_code(f)
+            code = extract_code(f) or extract_code(context_map.get(f, ""))
             if code:
                 file_map[f] = code
 
@@ -454,19 +480,27 @@ def main():
             except Exception:
                 pass
 
-        needed_b = [f for f in main_b_files if f not in b_cache]
+        needed_b = []
+        for f in main_b_files:
+            ctx = (context_map.get(f) or "").strip()
+            rec = b_cache.get(f)
+            if not rec:
+                needed_b.append(f)
+            elif ctx and rec.get('context_used') != ctx[:120]:
+                needed_b.append(f)
         if needed_b:
             print(f"[*] 调用 LLM 处理 {len(needed_b)} 个非标准番号文件 (模型: {args.b_model})...")
             batch_size = 12
             for idx in range(0, len(needed_b), batch_size):
                 chunk = needed_b[idx:idx+batch_size]
                 try:
-                    res_list = call_llm_scheme_b(chunk, args.api_base, args.api_key, model=args.b_model)
+                    res_list = call_llm_scheme_b(chunk, args.api_base, args.api_key, model=args.b_model, context_map=context_map)
                     for r in res_list:
                         orig = chunk[r['i']]
                         b_cache[orig] = {
                             'category': r.get('category', '杂项'),
-                            'new_name': sanitize_name(r.get('new_name', ''))
+                            'new_name': sanitize_name(r.get('new_name', '')),
+                            'context_used': (context_map.get(orig) or "").strip()[:120],
                         }
                     with open(b_cache_path, "w", encoding="utf-8") as f:
                         json.dump(b_cache, f, ensure_ascii=False, indent=2)
@@ -515,7 +549,36 @@ def main():
                     if os.path.exists(s_path) and not os.path.exists(d_path):
                         os.rename(s_path, d_path)
                         s_cnt += 1
+                        if old_f in context_map and new_f not in context_map:
+                            context_map[new_f] = context_map[old_f]
             print(f"[✓] 阶段 2 执行完成，成功重命名 {s_cnt} 个文件")
+
+    # ================== 阶段 2.5: 视觉识别兜底（可选） ==================
+    if args.vision_fallback:
+        vision_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vision_rename.py")
+        if os.path.exists(vision_script):
+            print("\n" + "="*50 + "\n【阶段 2.5】无语义 / [杂项] 视频抽帧视觉分析兜底\n" + "="*50)
+            v_cmd = [
+                sys.executable, vision_script,
+                "--dir", target_dir,
+                "--api-base", args.api_base,
+                "--api-key", args.api_key,
+                "--model", args.vision_model or args.b_model,
+                "--frames", str(args.vision_frames),
+                "--include-misc",
+            ]
+            if args.vision_interval and args.vision_interval > 0:
+                v_cmd.extend(["--interval", str(args.vision_interval)])
+            if ctx_path and os.path.exists(ctx_path):
+                v_cmd.extend(["--context-json", ctx_path])
+            if args.apply:
+                v_cmd.append("--apply")
+            try:
+                subprocess.run(v_cmd, check=False)
+            except Exception as e:
+                print(f"[!] 视觉识别兜底执行异常: {e}")
+        else:
+            print(f"[!] 未找到 vision_rename.py: {vision_script}")
 
     # ================== 阶段 3: 输出/刷新全局 CSV 检索清单 ==================
     csv_path = os.path.join(target_dir, "_索引_影片清单.csv")

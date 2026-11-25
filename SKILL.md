@@ -1,7 +1,7 @@
 ---
 name: jav-renamer
-description: 自动化识别日韩成人影片番号与泛品类资源（AI换脸/国产传媒/里番3D/欧美），多源抓取元数据（JavBus/r18.dev），利用 LLM 精准中译标题、女优名与三标签，批量规范重命名并生成检索清单。
-version: 2.1.0
+description: 自动化识别日韩成人影片番号与泛品类资源（AI换脸/国产传媒/里番3D/欧美），支持多源元数据抓取（JavBus/r18.dev）、Telegram 消息正文上下文融合，以及按间隔/均匀抽帧调用多模态视觉 LLM 评估场景、特色、剧情与出镜明星，批量规范重命名并生成检索清单。
+version: 2.2.0
 author: r4ain1, Hermes Agent
 license: MIT
 platforms: [windows, linux, macos]
@@ -75,6 +75,9 @@ python scripts/jav_rename.py --dir "W:/H11A/100"
 # 全品类完整流水线（直接应用执行重命名）
 python scripts/jav_rename.py --dir "W:/H11A/100" --apply
 
+# 全品类 + 注入外部上下文（如 TG 消息正文 _context.json）+ 无语义/[杂项] 自动抽帧视觉兜底
+python scripts/jav_rename.py --dir "W:/H11A/100" --context-json "_context.json" --vision-fallback --vision-interval 15 --apply
+
 # 仅处理日韩标准番号
 python scripts/jav_rename.py --dir "W:/H11A/100" --mode jav --apply
 
@@ -87,24 +90,42 @@ python scripts/recursive_rename.py --root "W:/H11A" --apply
 # 无语义文件视觉识别（protected_content_*/日期命名/纯哈希）
 python scripts/vision_rename.py --dir "C:/Users/Nero/Downloads"
 python scripts/vision_rename.py --dir "C:/Users/Nero/Downloads" --apply --frames 8
+
+# 按固定秒数间隔抽帧，并重扫已归入 [杂项] 的影片（评估场景、特色、剧情与出镜明星）
+python scripts/vision_rename.py --dir "D:/Videos/tg_downloads" --interval 15 --max-frames 12 --include-misc --apply
 ```
+
+### 外部上下文融合（TG 消息正文 / 频道简介）
+
+当 Telegram 下载的视频附件名本身只有日期或随机哈希（如 `6月26日(4).mp4`、`protected_content_*.mp4`），但原消息正文（`tdl chat export --with-content` 导出的 `text` 字段）包含番号、明星名或剧情简介时：
+- 在目标目录放置 `_context.json`（或通过 `--context-json <path>` 指定），格式为 `{"文件名.mp4": "消息正文内容"}`。
+- **阶段 1（标准 JAV）**：文件名未命中番号时，自动从对应 `context` 正文中提取番号并触发 JavBus / r18.dev 刮削。
+- **阶段 2（泛品类）**：将 `filename` 与 `context` 一并送入 LLM，优先依据正文提取明星、厂牌、剧情与分类。
+- **阶段 2.5（视觉兜底）**：若开启 `--vision-fallback`，也会将 `context` 作为辅助线索一并喂给多模态视觉模型。
 
 ### 无语义文件视觉识别流程（vision_rename.py）
 
-针对 Telegram/网盘抓取的 `protected_content_1790629947_3d3b1f60.mp4`、`8月9日.mp4` 类无语义文件：
+针对 Telegram/网盘抓取的 `protected_content_1790629947_3d3b1f60.mp4`、`6月26日(4).mp4`、`[杂项]` 类无语义文件：
 
-1. **抽帧**：ffmpeg 均匀抽 N 帧（默认 8 帧，避开片头尾 5%）
-2. **拼图**：PIL 把多帧拼成 4×2 网格图（降低视觉 LLM 调用成本）
-3. **识别**：视觉 LLM 提取厂牌水印/服装/场景/剧情/标签
-4. **命名**：按内容类型走对应命名模板（见命名规范 §3）
+1. **抽帧**：支持两种采样方式（避开片头尾 5%）：
+   - **均匀抽帧**：`--frames 8`（默认 8 帧）
+   - **按间隔抽帧**：`--interval 15 --max-frames 12`（每隔 N 秒截 1 帧，长视频自动封顶并均匀覆盖全片）
+2. **拼图**：优先用 Pillow 拼成 4×N 时间序网格图并标注 `#序号 时间戳`；**未安装 Pillow 时（如精简 Docker 容器）自动回退纯 `ffmpeg tile` 滤镜拼图**
+3. **识别**：多模态视觉 LLM 综合所有帧的变化，评估 **场景（scene）**、**特色亮点（features/costume）**、**剧情脉络（plot）**、**出镜明星/女优（actress）** 与 **厂牌水印（studio）**，并提炼 3–4 个中文标签
+4. **命名**：按内容类型走对应命名模板（见命名规范 §3），自动处理同名自增序号并清理临时抽帧图
 5. **缓存**：识别结果写入 `_vision_cache.json`，重复运行秒回
 
 **关键参数**：
-- `--frames 8`：抽帧数（剧情片建议 8-12，短片 4 够用）
+- `--frames 8`：均匀抽帧数（剧情片建议 8-12，短片 4 够用）
+- `--interval 15` / `--max-frames 12`：每隔 N 秒截取 1 帧并限制单片最多帧数
+- `--include-misc`：同时重扫已归入 `[杂项]` 且无视觉标签的视频
+- `--context-json`：传入 TG 消息正文等辅助线索 JSON
+- `--limit N`：限制本次最多处理条数（小批量试跑预览用）
+- `--keep-frames`：保留 `_vision_frames` 截图（默认识别后自动清理省空间）
 - `--concurrency 3`：并发抽帧+识别（太高易超时）
-- `--model`：视觉模型（默认 `gemini-3.8-flash-high`，备选 `gpt-4o`/`claude-sonnet-4-6`）
+- `--model`：视觉模型（默认 `group/flash`，备选 `group/smart` / `auto/gemini-3.8-flash`）
 
-**无语义判定规则**（`needs_vision`）：未匹配标准番号 + 无中文 + 命中 `protected_content_*`/`media_group_*`/`X月X日`/纯哈希前缀 → 视为无语义。
+**无语义判定规则**（`needs_vision`）：优先匹配 `X月X日` 日期命名；未匹配标准番号 + 无有效中文 + 命中 `protected_content_*`/`media_group_*`/`IMG_*`/纯数字/纯哈希前缀 → 视为无语义；启用 `--include-misc` 时也包含尚未带视觉标签的 `[杂项]` 文件。
 
 ### 损坏文件处理
 
@@ -117,20 +138,20 @@ python scripts/vision_rename.py --dir "C:/Users/Nero/Downloads" --apply --frames
 - `--mode`：执行模式，`all`（默认全品类）、`jav`（仅日韩标准番号）、`non-jav`（仅非标准资源）。
 - `--apply`：实际执行重命名（缺省时仅生成计划和预览）。
 - `--proxy`：网络代理地址（默认 `http://127.0.0.1:7890`）。
-- `--api-base`：OpenAI 兼容接口（默认 `http://127.0.0.1:8317/v1`）。
-- `--jav-model`：日韩元数据处理模型（默认 `gemini-3.8-flash-high`）。
-- `--b-model`：泛品类处理模型（默认 `claude-sonnet-4-6`）。
+- `--api-base`：OpenAI 兼容接口（默认 Magpie `http://127.0.0.1:3425/v1`）。
+- `--jav-model`：日韩元数据处理模型（默认 `group/flash`）。
+- `--b-model`：泛品类处理模型（默认 `group/smart`）。
 
 ---
 
 ## 依赖要求
 
 - Python 3.8+
-- **ffmpeg / ffprobe** 在 PATH 中（视觉识别抽帧必需）
-- **Pillow**（`pip install pillow`，视觉识别拼图必需）
+- **ffmpeg / ffprobe** 在 PATH 或 `/app/bin` 中（视觉识别抽帧必需）
+- **Pillow**（可选，`pip install pillow`，用于绘制帧序号时间戳；未安装时自动使用纯 `ffmpeg tile` 拼图）
 - 网络代理（访问 JavBus / r18.dev，如本地 Clash 代理端口 7890）
-- OpenAI 兼容的 LLM 接口（本地 Gateway `http://127.0.0.1:8317/v1` 或各类云端 API）
-- 视觉识别需支持 image_url 的多模态模型（gemini-3.8-flash-high / gpt-4o / claude-sonnet-4-6）
+- OpenAI 兼容的 LLM 接口（本地 Magpie 网关 `http://127.0.0.1:3425/v1` 或各类云端 API）
+- 视觉识别需支持 image_url 的多模态模型（`group/flash` / `group/smart` / `auto/gemini-3.8-flash`）
 
 ## 踩坑与降级经验
 
